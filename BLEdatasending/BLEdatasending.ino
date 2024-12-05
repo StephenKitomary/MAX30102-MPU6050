@@ -13,12 +13,10 @@ Adafruit_MPU6050 mpu;
 
 // MAX30105 Setup
 MAX30105 particleSensor;
-
 const byte RATE_SIZE = 8;
 byte rates[RATE_SIZE];
 byte rateSpot = 0;
 long lastBeat = 0;
-
 float beatsPerMinute;
 int beatAvg;
 
@@ -31,11 +29,19 @@ int LED_PIN = 0;
 #define SERVICE_UUID        "0000fff0-0000-1000-8000-00805f9b34fb"
 #define CHARACTERISTIC_UUID "0000fff0-0000-1000-8000-00805f9b34fb"
 
-// Threshold for movement detection
-const float movement_threshold = 0.1;
-float prev_ax = 0, prev_ay = 0, prev_az = 0;
+// Timing variables
+unsigned long lastMPURead = 0;
+unsigned long lastMAXRead = 0;
+unsigned long lastBLEUpdate = 0;
 
-// BLE Server Callbacks
+// Sampling intervals
+const unsigned long MPU_INTERVAL = 100;   // 100 ms for MPU6050
+const unsigned long MAX_INTERVAL = 10;   // 10 ms for MAX30105
+const unsigned long BLE_INTERVAL = 500;  // 500 ms for BLE notifications
+
+float prev_ax = 0, prev_ay = 0, prev_az = 0;
+float delta_ax = 0, delta_ay = 0, delta_az = 0; // Declare globally
+
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     deviceConnected = true;
@@ -48,7 +54,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-void setup(void) {
+void setup() {
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
 
@@ -90,59 +96,75 @@ void setup(void) {
 }
 
 void loop() {
-  if (!deviceConnected) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(500);
-    digitalWrite(LED_PIN, LOW);
-    delay(500);
-    return;
+  unsigned long currentTime = millis();
+
+  // Read MPU6050 at regular intervals
+  if (currentTime - lastMPURead >= MPU_INTERVAL) {
+    lastMPURead = currentTime;
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    // Calculate movement
+    delta_ax = abs(a.acceleration.x - prev_ax);
+    delta_ay = abs(a.acceleration.y - prev_ay);
+    delta_az = abs(a.acceleration.z - prev_az);
+    prev_ax = a.acceleration.x;
+    prev_ay = a.acceleration.y;
+    prev_az = a.acceleration.z;
+
+    Serial.print("MPU Movement: ");
+    Serial.println(delta_ax + delta_ay + delta_az);
   }
 
-  // MPU6050 Data
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  float delta_ax = abs(a.acceleration.x - prev_ax);
-  float delta_ay = abs(a.acceleration.y - prev_ay);
-  float delta_az = abs(a.acceleration.z - prev_az);
-  prev_ax = a.acceleration.x;
-  prev_ay = a.acceleration.y;
-  prev_az = a.acceleration.z;
-  float total_movement = delta_ax + delta_ay + delta_az;
+  // Read MAX30105 at regular intervals
+  if (currentTime - lastMAXRead >= MAX_INTERVAL) {
+    lastMAXRead = currentTime;
 
-  // MAX30105 Data
-  long irValue = particleSensor.getIR();
-  if (checkForBeat(irValue)) {
-    long delta = millis() - lastBeat;
-    lastBeat = millis();
-    beatsPerMinute = 60 / (delta / 1000.0);
-    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
-      rates[rateSpot++] = (byte)beatsPerMinute;
-      rateSpot %= RATE_SIZE;
-      beatAvg = 0;
-      for (byte x = 0 ; x < RATE_SIZE ; x++) {
-        beatAvg += rates[x];
+    long irValue = particleSensor.getIR();
+    if (checkForBeat(irValue)) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) {
+          beatAvg += rates[x];
+        }
+        beatAvg /= RATE_SIZE;
       }
-      beatAvg /= RATE_SIZE;
     }
+    if (irValue < 10000) {
+      beatsPerMinute = 0;
+      beatAvg = 0;
+    }
+
+    Serial.print("IR=");
+    Serial.print(irValue);
+    Serial.print(", BPM=");
+    Serial.print(beatsPerMinute);
+    Serial.print(", Avg BPM=");
+    Serial.println(beatAvg);
   }
-  if (irValue < 10000) {
-    beatsPerMinute = 0;
-    beatAvg = 0;
+
+  // Send BLE notifications at regular intervals
+  if (deviceConnected && (currentTime - lastBLEUpdate >= BLE_INTERVAL)) {
+    lastBLEUpdate = currentTime;
+
+    // Combine movement and heart rate data into one payload
+    String data = String("Accel X: ") + String(prev_ax) +
+                  ", Y: " + String(prev_ay) +
+                  ", Z: " + String(prev_az) +
+                  ", Movement: " + String(delta_ax + delta_ay + delta_az) +
+                  ", BPM: " + String(beatsPerMinute) +
+                  ", Avg BPM: " + String(beatAvg);
+
+    pCharacteristic->setValue(data.c_str());
+    pCharacteristic->notify();
+
+    Serial.println("Sent data: " + data);
   }
-
-  // Combine data
-  String data = String("Accel X: ") + String(a.acceleration.x) +
-                ", Y: " + String(a.acceleration.y) +
-                ", Z: " + String(a.acceleration.z) +
-                ", Total movement: " + String(total_movement) +
-                ", IR: " + String(irValue) +
-                ", BPM: " + String(beatsPerMinute) +
-                ", Avg BPM: " + String(beatAvg);
-
-  // Send BLE notification
-  pCharacteristic->setValue(data.c_str());
-  pCharacteristic->notify();
-  Serial.println("Sent data: " + data);
-
-  delay(500);
 }
